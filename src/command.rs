@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::{Instant, sleep};
+use zeroize::Zeroizing;
 
 use crate::{
     chain::{
@@ -39,6 +40,7 @@ use crate::{
         parse_collection_locator,
     },
     signing::{WalletSigner, WalletSignerError},
+    snipe::{self, SnipeError},
     sponsored::{
         AUDITED_EXECUTOR_RUNTIME_HASH, DelegationState, SponsoredMintError, classify_delegation,
     },
@@ -103,6 +105,44 @@ pub enum Command {
         #[command(subcommand)]
         command: WalletCommand,
     },
+    /// Snipe a public `SeaDrop` stage with locally built calldata — no `OpenSea`
+    /// API on the critical path. Signs every wallet before the stage opens and
+    /// blasts pre-built transactions to every RPC in parallel.
+    Snipe {
+        /// `OpenSea` collection slug, collection URL, or NFT contract address.
+        #[arg(long)]
+        collection: String,
+        /// Mint quantity per wallet (default: 1, or the manifest quantity with --wallets).
+        #[arg(long)]
+        quantity: Option<u64>,
+        /// Private key for a minting wallet (repeatable).
+        #[arg(long = "key", value_name = "PRIVATE_KEY")]
+        keys: Vec<String>,
+        /// Wallet manifest (wallets.json) to use instead of --key.
+        #[arg(long, value_name = "FILE")]
+        wallets: Option<PathBuf>,
+        /// RPC endpoint to probe, read from, and blast to (repeatable).
+        #[arg(long = "rpc", value_name = "URL")]
+        rpc_urls: Vec<String>,
+        /// Chain key when no --rpc is given: ethereum, base, or robinhood.
+        #[arg(long, value_name = "CHAIN")]
+        chain: Option<String>,
+        /// Max fee per gas in gwei (default: automatic from the chain).
+        #[arg(long, value_name = "GWEI")]
+        max_fee_gwei: Option<String>,
+        /// Max priority fee per gas in gwei (default: automatic from the chain).
+        #[arg(long, value_name = "GWEI")]
+        priority_fee_gwei: Option<String>,
+        /// Gas limit per mint (default: 250000).
+        #[arg(long, default_value_t = 250_000)]
+        gas_limit: u64,
+        /// Fire this many ms before the stage opens (mempool trick).
+        #[arg(long, default_value_t = 0)]
+        early_fire_ms: u64,
+        /// Fire immediately even if the stage opens later.
+        #[arg(long)]
+        fire_now: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -149,6 +189,8 @@ pub enum CommandError {
     WalletGenerator(#[from] WalletGeneratorError),
     #[error(transparent)]
     NativeFunds(#[from] NativeFundsError),
+    #[error(transparent)]
+    Snipe(#[from] SnipeError),
     #[error("quantity and gas limit must both be greater than zero")]
     InvalidMintSelection,
     #[error("selected stage was not found")]
@@ -229,10 +271,43 @@ pub enum CommandError {
     DeploymentReverted(u64),
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn execute(cli: Cli) -> Result<(), CommandError> {
     let command = match cli.command {
         Command::Wallets { command } => return create_wallets(command),
         Command::DeployExecutor => return deploy_executor().await,
+        Command::Snipe {
+            collection,
+            quantity,
+            keys,
+            wallets,
+            rpc_urls,
+            chain,
+            max_fee_gwei,
+            priority_fee_gwei,
+            gas_limit,
+            early_fire_ms,
+            fire_now,
+        } => {
+            return snipe::run_snipe(snipe::SnipeOptions {
+                collection,
+                quantity,
+                keys: keys.into_iter().map(Zeroizing::new).collect(),
+                wallets_file: wallets,
+                rpc_urls,
+                chain,
+                max_fee_per_gas: max_fee_gwei.as_deref().map(snipe::parse_gwei).transpose()?,
+                max_priority_fee_per_gas: priority_fee_gwei
+                    .as_deref()
+                    .map(snipe::parse_gwei)
+                    .transpose()?,
+                gas_limit,
+                early_fire_ms,
+                fire_now,
+            })
+            .await
+            .map_err(Into::into);
+        }
         command => command,
     };
     let loaded = LoadedConfig::load()?;
@@ -287,6 +362,7 @@ pub async fn execute(cli: Cli) -> Result<(), CommandError> {
                 unreachable!("handled before configuration loading")
             }
             Command::Calldata { .. } => unreachable!("handled before wallet mode routing"),
+            Command::Snipe { .. } => unreachable!("handled before configuration loading"),
         };
     }
     if let Command::Mint {
@@ -319,6 +395,7 @@ pub async fn execute(cli: Cli) -> Result<(), CommandError> {
             unreachable!("handled before configuration loading")
         }
         Command::Calldata { .. } => unreachable!("handled before wallet mode routing"),
+        Command::Snipe { .. } => unreachable!("handled before configuration loading"),
     }
 }
 

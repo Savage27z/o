@@ -18,6 +18,7 @@ pub struct WalletIdentity {
     pub address: Address,
 }
 
+#[derive(Clone)]
 pub struct WalletSigner {
     identity: WalletIdentity,
     signing_key: SigningKey,

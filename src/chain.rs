@@ -359,6 +359,50 @@ impl ChainGateway {
         parse_quantity_u64(&estimate).map_err(|_| ChainError::InvalidResponse { index: rpc_index })
     }
 
+    /// Read-only contract call (`eth_call`) against the latest block.
+    pub async fn call_contract(
+        &self,
+        config: &ChainConfig,
+        rpc_index: usize,
+        target: Address,
+        calldata: &[u8],
+    ) -> Result<Bytes, ChainError> {
+        let endpoint = endpoint(config, rpc_index)?;
+        let result: String = self
+            .request(
+                endpoint,
+                rpc_index,
+                "eth_call",
+                json!([{
+                    "to": target.to_checksum(None),
+                    "data": format!("0x{}", hex::encode(calldata)),
+                }, "latest"]),
+            )
+            .await?;
+        hex::decode(result.strip_prefix("0x").unwrap_or(&result))
+            .map(Bytes::from)
+            .map_err(|_| ChainError::InvalidResponse { index: rpc_index })
+    }
+
+    /// Pending nonce for a wallet (`eth_getTransactionCount`).
+    pub async fn transaction_count(
+        &self,
+        config: &ChainConfig,
+        rpc_index: usize,
+        wallet: Address,
+    ) -> Result<u64, ChainError> {
+        let endpoint = endpoint(config, rpc_index)?;
+        let count: String = self
+            .request(
+                endpoint,
+                rpc_index,
+                "eth_getTransactionCount",
+                json!([wallet.to_checksum(None), "pending"]),
+            )
+            .await?;
+        parse_quantity_u64(&count).map_err(|_| ChainError::InvalidResponse { index: rpc_index })
+    }
+
     pub async fn send_raw_transaction(
         &self,
         config: &ChainConfig,

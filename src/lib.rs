@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod blast;
 pub mod chain;
 pub mod command;
 pub mod config;
@@ -12,7 +13,9 @@ pub mod multi_mint;
 pub mod multi_wallet;
 pub mod nft;
 pub mod opensea;
+pub mod seadrop;
 pub mod signing;
+pub mod snipe;
 pub mod sponsored;
 pub mod terminal;
 pub mod transaction;
