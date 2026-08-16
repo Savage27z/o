@@ -246,6 +246,8 @@ cargo build --release --locked
 | `opensea-mint mint --withdraw` | **Self-funded multi-wallet** | Withdraws each wallet's safely signable native-token balance to the configured recipient | Yes, after confirmation |
 | `opensea-mint mint --undelegate` | **Multi-wallet cleanup** | Revokes EIP-7702 delegation for every manifest wallet | Yes, after confirmation |
 | `opensea-mint calldata ...` | **Read-only multi-wallet** | Authenticates wallets and fetches validated active-stage mint calldata | No |
+| `opensea-mint snipe ...` | **Local public mints** | Builds `mintPublic` calldata on-chain, pre-signs every wallet, and blasts to all RPCs at T-0 — no OpenSea API on the critical path | Yes, at stage open |
+| `opensea-mint bot` | **Telegram control** | Runs the owner-only Telegram bot: wizard-driven snipes, wallet listing, manifest upload | Yes, after in-chat confirmation |
 | `opensea-mint wallets create ...` | Local utility | Creates a new private-key manifest without loading `.env` or connecting to a network | No |
 
 ### `doctor` and `deploy-executor` parameters
@@ -299,6 +301,64 @@ opensea-mint wallets create --count <COUNT> --quantity <QUANTITY> --output <OUTP
 | `--version`, `-V` | No value | Shows the CLI version when used at the top level |
 
 Any installed-command example can be replaced with `cargo run --release --locked -- <arguments>`. A direct target path can be used instead on the matching operating system.
+
+### `snipe` — local public SeaDrop mints
+
+The fast path merged from the `nft-public-mint` sniper: `mintPublic` calldata is
+assembled from on-chain state (`getPublicDrop` / `getAllowedFeeRecipients`), so
+there is no OpenSea token, no rate limit, and no API round-trip on the critical
+path. Every wallet transaction is signed and serialised **before** the stage
+opens; at T-0 the only work left is writing pre-built JSON bodies to every RPC
+in parallel.
+
+```text
+opensea-mint snipe --collection <COLLECTION> --chain <CHAIN> [--key <KEY>... | --wallets <FILE>]
+                   [--rpc <URL>...] [--quantity <N>] [--max-fee-gwei <F>] [--priority-fee-gwei <F>]
+                   [--gas-limit <N>] [--early-fire-ms <MS>] [--fire-now]
+```
+
+| Parameter | Value | Default | Requirements |
+| --- | --- | --- | --- |
+| `--collection <COLLECTION>` | OpenSea slug, OpenSea collection URL, or NFT contract address | None | Must have a public stage on the SeaDrop singleton |
+| `--chain <CHAIN>` | `ethereum`, `base`, or `robinhood` | None (RPC chain ID is authoritative) | Used for public RPC defaults and Alchemy-key expansion |
+| `--key <KEY>` | Private key (repeatable) | None | At least one of `--key` or `--wallets` |
+| `--wallets <FILE>` | Path to a version-1 wallet manifest | None | Supports `--quantity` override and per-wallet manifest quantities |
+| `--rpc <URL>` | RPC endpoint (repeatable, all are blasted) | `.env` `RPC_URL`, then chain public nodes | HTTPS, except loopback |
+| `--max-fee-gwei` / `--priority-fee-gwei` | Decimal gwei, e.g. `0.05/0.01` | Chain estimate | Omitted values auto-fill from the chain |
+| `--early-fire-ms <MS>` | Fire this many ms before stage open (mempool trick) | `0` | Kept in the mempool until the contract allows |
+| `--fire-now` | Flag | Off | Dispatch immediately even if the stage opens later |
+
+Allowlist/FCFS stages (`mintSigned`) still need OpenSea signatures and go
+through `opensea-mint mint`.
+
+### `bot` — Telegram control surface
+
+Runs an owner-only Telegram bot that drives the same snipe engine. Long-polls
+`getUpdates` (no webhook or public port needed).
+
+```text
+opensea-mint bot
+```
+
+Configuration (`.env`):
+
+| Setting | Purpose |
+| --- | --- |
+| `BOT_TOKEN` | Required. Bot token from [@BotFather](https://t.me/BotFather). |
+| `ALLOWED_CHAT_IDS` | Required. Comma-separated numeric chat ids; every other chat is ignored. |
+| `WALLETS_FILE` | Optional. Manifest the bot snipes with (default `wallets.json`). |
+| `RPC_URL_BOT` | Optional. Comma-separated RPCs for bot snipes; falls back to `RPC_URL`, then per-chain public nodes. |
+
+Commands:
+
+- `/wallets` — list manifest wallets (addresses only, never keys)
+- `/snipe` — wizard: collection → chain → quantity → wallets → gas → early fire → confirm
+- `/cancel`, `/status`, `/help`
+- **Upload a `wallets.json` file** — imports it as the server-side manifest; keys never appear in chat
+
+Confirmed snipes run in a background task: progress (price, gas, signed count,
+fire moment, receipts) streams back to the chat, and the fire itself stays
+server-side at T-0.
 
 ---
 

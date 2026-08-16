@@ -13,6 +13,7 @@ use tokio::time::{Instant, sleep};
 use zeroize::Zeroizing;
 
 use crate::{
+    bot::{self, BotError},
     chain::{
         AccountState, ChainError, ChainGateway, CodeHashCheck, FeeEstimate, ReceiptPollingPolicy,
         SubmissionInputs, TransactionReceipt,
@@ -143,6 +144,9 @@ pub enum Command {
         #[arg(long)]
         fire_now: bool,
     },
+    /// Run the Telegram bot control surface (long-polling, owner-only).
+    /// Requires `BOT_TOKEN` and `ALLOWED_CHAT_IDS` in .env.
+    Bot,
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,6 +195,8 @@ pub enum CommandError {
     NativeFunds(#[from] NativeFundsError),
     #[error(transparent)]
     Snipe(#[from] SnipeError),
+    #[error(transparent)]
+    Bot(#[from] BotError),
     #[error("quantity and gas limit must both be greater than zero")]
     InvalidMintSelection,
     #[error("selected stage was not found")]
@@ -276,6 +282,7 @@ pub async fn execute(cli: Cli) -> Result<(), CommandError> {
     let command = match cli.command {
         Command::Wallets { command } => return create_wallets(command),
         Command::DeployExecutor => return deploy_executor().await,
+        Command::Bot => return bot::run_bot().await.map_err(Into::into),
         Command::Snipe {
             collection,
             quantity,
@@ -294,6 +301,7 @@ pub async fn execute(cli: Cli) -> Result<(), CommandError> {
                 quantity,
                 keys: keys.into_iter().map(Zeroizing::new).collect(),
                 wallets_file: wallets,
+                wallet_indices: None,
                 rpc_urls,
                 chain,
                 max_fee_per_gas: max_fee_gwei.as_deref().map(snipe::parse_gwei).transpose()?,
@@ -304,6 +312,7 @@ pub async fn execute(cli: Cli) -> Result<(), CommandError> {
                 gas_limit,
                 early_fire_ms,
                 fire_now,
+                notify: None,
             })
             .await
             .map_err(Into::into);
@@ -358,11 +367,11 @@ pub async fn execute(cli: Cli) -> Result<(), CommandError> {
                 .await
                 .map_err(Into::into),
             Command::Mint { .. } => unreachable!("clap enforces exclusive mint operations"),
-            Command::Wallets { .. } | Command::DeployExecutor => {
-                unreachable!("handled before configuration loading")
-            }
+            Command::Wallets { .. }
+            | Command::DeployExecutor
+            | Command::Snipe { .. }
+            | Command::Bot => unreachable!("handled before configuration loading"),
             Command::Calldata { .. } => unreachable!("handled before wallet mode routing"),
-            Command::Snipe { .. } => unreachable!("handled before configuration loading"),
         };
     }
     if let Command::Mint {
@@ -391,11 +400,11 @@ pub async fn execute(cli: Cli) -> Result<(), CommandError> {
             undelegate: false,
         } => mint(&config, &signer).await,
         Command::Mint { .. } => unreachable!("handled above"),
-        Command::Wallets { .. } | Command::DeployExecutor => {
-            unreachable!("handled before configuration loading")
-        }
+        Command::Wallets { .. }
+        | Command::DeployExecutor
+        | Command::Snipe { .. }
+        | Command::Bot => unreachable!("handled before configuration loading"),
         Command::Calldata { .. } => unreachable!("handled before wallet mode routing"),
-        Command::Snipe { .. } => unreachable!("handled before configuration loading"),
     }
 }
 

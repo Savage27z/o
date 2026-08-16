@@ -157,6 +157,8 @@ pub struct SnipeOptions {
     pub quantity: Option<u64>,
     pub keys: Vec<Zeroizing<String>>,
     pub wallets_file: Option<PathBuf>,
+    /// Optional 0-based subset of manifest wallets to fire.
+    pub wallet_indices: Option<Vec<usize>>,
     pub rpc_urls: Vec<String>,
     pub chain: Option<String>,
     pub max_fee_per_gas: Option<U256>,
@@ -164,6 +166,8 @@ pub struct SnipeOptions {
     pub gas_limit: u64,
     pub early_fire_ms: u64,
     pub fire_now: bool,
+    /// Optional channel receiving every progress line (bot streaming).
+    pub notify: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl Default for SnipeOptions {
@@ -173,6 +177,7 @@ impl Default for SnipeOptions {
             quantity: None,
             keys: Vec::new(),
             wallets_file: None,
+            wallet_indices: None,
             rpc_urls: Vec::new(),
             chain: None,
             max_fee_per_gas: None,
@@ -180,6 +185,7 @@ impl Default for SnipeOptions {
             gas_limit: DEFAULT_GAS_LIMIT,
             early_fire_ms: 0,
             fire_now: false,
+            notify: None,
         }
     }
 }
@@ -467,6 +473,19 @@ fn load_wallets(options: &SnipeOptions) -> Result<Vec<(WalletSigner, u64)>, Snip
             wallets.push((entry.signer().clone(), quantity));
         }
     }
+    if let Some(indices) = &options.wallet_indices {
+        let mut selected = Vec::with_capacity(indices.len());
+        for index in indices {
+            let wallet = wallets.get(*index).ok_or_else(|| {
+                SnipeError::InvalidQuantity(format!(
+                    "wallet index {index} out of range ({} wallet(s) available)",
+                    wallets.len()
+                ))
+            })?;
+            selected.push(wallet.clone());
+        }
+        wallets = selected;
+    }
     if wallets.is_empty() {
         return Err(SnipeError::NoWallets);
     }
@@ -582,8 +601,92 @@ async fn wait_for_receipt(
 /// reporting; nothing is ever broadcast before `Fire?`-style confirmation is
 /// baked into the CLI (dispatch only happens after an explicit `--fire-now`,
 /// a passed stage start, or an auto-detected live stage).
+/// Summary of a planned snipe, used by the bot's confirm step.
+#[derive(Debug)]
+pub struct SnipePreview {
+    pub nft_contract: Address,
+    pub chain_id: u64,
+    pub chain_name: String,
+    pub price: U256,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub fee_recipient: Address,
+    pub wallet_count: usize,
+}
+
+/// Resolve collection + chain + public stage and report what a snipe would
+/// do, without signing or broadcasting anything. The bot shows this summary
+/// before asking for confirmation.
+pub async fn preview(options: &SnipeOptions) -> Result<SnipePreview, SnipeError> {
+    let _ = dotenvy::dotenv();
+    let read_client = reqwest::Client::new();
+    let nft_contract = resolve_nft_contract(&options.collection, &read_client).await?;
+    let candidates = resolve_rpc_candidates(options)?;
+    let gateway = ChainGateway::new(READ_TIMEOUT)?;
+    let expected_chain_id = options
+        .chain
+        .as_deref()
+        .and_then(resolve_chain)
+        .map(|p| p.chain_id);
+    let (chain_id, rpc_urls) = run_probe(&gateway, &candidates, expected_chain_id).await?;
+    let config = ChainConfig { chain_id, rpc_urls };
+    let base = seadrop::build_local_mint_plan(&gateway, &config, 1, nft_contract, 1)
+        .await?
+        .ok_or(SnipeError::NoPublicStage)?;
+    let wallet_count = load_wallets(options)?.len();
+    Ok(SnipePreview {
+        nft_contract,
+        chain_id,
+        chain_name: chain_by_id(chain_id)
+            .map_or_else(|| "unknown".to_owned(), |p| p.key.to_owned()),
+        price: base.drop.mint_price,
+        start_time: base.drop.start_time,
+        end_time: base.drop.end_time,
+        fee_recipient: base.fee_recipient,
+        wallet_count,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
+    let notify = options.notify.clone();
+    macro_rules! emit_info {
+        ($msg:expr) => {{
+            let msg: String = $msg.into();
+            logging::info(&msg);
+            if let Some(tx) = &notify {
+                let _ = tx.send(msg);
+            }
+        }};
+    }
+    macro_rules! emit_success {
+        ($msg:expr) => {{
+            let msg: String = $msg.into();
+            logging::success(&msg);
+            if let Some(tx) = &notify {
+                let _ = tx.send(msg);
+            }
+        }};
+    }
+    macro_rules! emit_warn {
+        ($msg:expr) => {{
+            let msg: String = $msg.into();
+            logging::warn(&msg);
+            if let Some(tx) = &notify {
+                let _ = tx.send(msg);
+            }
+        }};
+    }
+    macro_rules! emit_error {
+        ($msg:expr) => {{
+            let msg: String = $msg.into();
+            logging::error(&msg);
+            if let Some(tx) = &notify {
+                let _ = tx.send(msg);
+            }
+        }};
+    }
+
     // Load .env for RPC_URL / OPENSEA_API_KEY without requiring one.
     let _ = dotenvy::dotenv();
 
@@ -607,10 +710,10 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     let chain_name = chain_by_id(chain_id).map_or("unknown", |profile| profile.key);
 
     logging::section_break();
-    logging::info(format!(
+    emit_info!(format!(
         "SNIPE {nft_contract} on {chain_name} (chain id {chain_id})"
     ));
-    logging::info(format!("RPC blast targets: {}", rpc_urls.len()));
+    emit_info!(format!("RPC blast targets: {}", rpc_urls.len()));
 
     // ── Build the public-stage plan from on-chain data only ──
     let base = seadrop::build_local_mint_plan(&gateway, &config, 1, nft_contract, 1)
@@ -633,14 +736,14 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
         })
         .collect();
 
-    logging::info(format!(
+    emit_info!(format!(
         "SeaDrop: {} | price {} wei × {} wallet(s)",
         base.to,
         drop.mint_price,
         plans.len()
     ));
-    logging::info(format!("Fee recipient: {}", base.fee_recipient));
-    logging::info(format!(
+    emit_info!(format!("Fee recipient: {}", base.fee_recipient));
+    emit_info!(format!(
         "Calldata: {} bytes (identical for every wallet)",
         (base.data.len() - 4)
     ));
@@ -685,14 +788,14 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
             }
         };
 
-    logging::info(format!(
+    emit_info!(format!(
         "Gas: limit {gas_limit} | max fee {} gwei | priority {} gwei",
         format_gwei(max_fee_per_gas),
         format_gwei(max_priority_fee_per_gas)
     ));
 
     // ── Per-wallet balance + nonce, pre-sign everything ──
-    logging::info("Checking balances and signing...");
+    emit_info!("Checking balances and signing...");
     let mut prepared: Vec<PreparedWallet> = Vec::new();
     for (index, (signer, _quantity, plan)) in plans.iter().enumerate() {
         let account: AccountState = gateway
@@ -733,7 +836,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
             blast: blast::prepare_blast(&signed),
         });
     }
-    logging::success(format!(
+    emit_success!(format!(
         "{} tx(s) signed and serialised — nothing left to compute at fire time",
         prepared.len()
     ));
@@ -759,7 +862,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     } else if options.early_fire_ms > 0 && fire_time > now {
         wait_until_fire(fire_time, "Early fire window").await;
     } else {
-        logging::info("Stage is live (or --fire-now) — dispatching immediately");
+        emit_info!("Stage is live (or --fire-now) — dispatching immediately");
     }
 
     let dispatch_start = Instant::now();
@@ -774,7 +877,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     }
     let dispatch_ms = dispatch_start.elapsed().as_millis();
     let since_stage = (unix_millis() - stage_start).max(0);
-    logging::success(format!(
+    emit_success!(format!(
         "DISPATCHED {} tx(s) ({}ms dispatch, +{}ms after stage open)",
         fired.len(),
         dispatch_ms,
@@ -785,18 +888,18 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
 
     for (index, address, results) in &rejected {
         let reasons = blast::rejection_reasons(results);
-        logging::warn(format!(
+        emit_warn!(format!(
             "[W{index}] {address} REJECTED by every RPC — never broadcast"
         ));
         for reason in reasons {
-            logging::warn(format!("    {reason}"));
+            emit_warn!(format!("    {reason}"));
         }
         if results.iter().any(|r| {
             r.error
                 .as_deref()
                 .is_some_and(|e| e.to_ascii_lowercase().contains("less than block base fee"))
         }) {
-            logging::warn("    → max fee is under the chain's base fee. Raise it and re-run.");
+            emit_warn!("    → max fee is under the chain's base fee. Raise it and re-run.");
         }
     }
 
@@ -806,7 +909,7 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
     }
 
     // ── Receipts (only for txs an endpoint actually accepted) ──
-    logging::info("Waiting for receipts...");
+    emit_info!("Waiting for receipts...");
     for (index, address, results) in &accepted {
         let tx_hash = results
             .iter()
@@ -826,23 +929,23 @@ pub async fn run_snipe(options: SnipeOptions) -> Result<(), SnipeError> {
                     "FAILED"
                 };
                 if receipt.is_success {
-                    logging::success(format!(
+                    emit_success!(format!(
                         "[W{index}] {address} | block {} | {status}",
                         receipt.block_number
                     ));
                 } else {
-                    logging::error(format!(
+                    emit_error!(format!(
                         "[W{index}] {address} | block {} | {status}",
                         receipt.block_number
                     ));
                 }
-                logging::info(format!(
+                emit_info!(format!(
                     "[W{index}] track: {}",
                     explorer_url(chain_id, &tx_hash)
                 ));
             }
             None => {
-                logging::warn(format!(
+                emit_warn!(format!(
                     "[W{index}] TIMEOUT — check: {}",
                     explorer_url(chain_id, &tx_hash)
                 ));
